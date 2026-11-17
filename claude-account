@@ -1,0 +1,716 @@
+#!/usr/bin/env bash
+# Run as `claude`: start Claude Code under the Account chosen for the current folder.
+# Run as `claude-account`: manage Accounts and Folder Rules (see `claude-account help`).
+# Kept compatible with the bash 3.2 that ships with macOS: no associative arrays, no ${x^}.
+
+unset CDPATH
+
+ROOT="$HOME/.claude-accounts"
+RULES="$ROOT/rules"
+DEFAULT_DIR="$HOME/.claude"
+SETUP_ITEMS="settings.json settings.local.json keybindings.json CLAUDE.md agents commands skills hooks plugins output-styles"
+# State-file keys that belong to one subscription and must not be copied to another Account.
+PER_SUBSCRIPTION='^(oauthAccount|userID|hasAvailableSubscription|isQualifiedForDataSharing|groveChoiceSeenAt|fableOverageConsentV2|managedSettingsNoticeSeenOrg|claudeAiMcpEverConnected|passesLastSeenRemaining)$|cache'
+
+DEFAULT=personal
+[ -f "$ROOT/default" ] && read -r DEFAULT < "$ROOT/default"
+[ -n "$DEFAULT" ] || DEFAULT=personal
+
+die() { printf 'claude-account: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'claude-account: %s\n' "$*" >&2; }
+
+# Helpers below return through REPLY so the launch path avoids subshells.
+trim() {
+  local s=$1
+  s=${s#"${s%%[![:space:]]*}"}
+  s=${s%"${s##*[![:space:]]}"}
+  REPLY=$s
+}
+
+expand_path() {
+  local p=$1
+  case $p in
+    "~") p=$HOME ;;
+    "~/"*) p="$HOME/${p#\~/}" ;;
+    /*) ;;
+    *) p="$PWD/$p" ;;
+  esac
+  while [ "${#p}" -gt 1 ] && [ "${p%/}" != "$p" ]; do p=${p%/}; done
+  REPLY=$p
+}
+
+tildify() {
+  case $1 in
+    "$HOME") printf '~' ;;
+    "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+phys_dir() { (cd -P -- "$1" 2>/dev/null && pwd -P); }
+
+resolve_file() {
+  local f=$1 l
+  case $f in */*) ;; *) f="./$f" ;; esac
+  while [ -L "$f" ]; do
+    l=$(readlink "$f")
+    case $l in /*) f=$l ;; *) f="${f%/*}/$l" ;; esac
+  done
+  printf '%s/%s' "$(cd -P -- "${f%/*}" && pwd -P)" "${f##*/}"
+}
+
+capitalize() {
+  printf '%s%s' "$(printf '%s' "${1:0:1}" | tr '[:lower:]' '[:upper:]')" "${1:1}"
+}
+
+valid_name() {
+  case $1 in
+    # Character classes, not a-z: bash 3.2 ranges follow the locale and let uppercase in.
+    '' | *[![:lower:][:digit:]_-]* | [-_]*) return 1 ;;
+    bin | rules | default) return 1 ;;
+  esac
+  return 0
+}
+
+account_dir() {
+  if [ "$1" = "$DEFAULT" ]; then printf '%s' "$DEFAULT_DIR"; else printf '%s' "$ROOT/$1"; fi
+}
+
+# Claude Code reads ~/.claude.json for the default directory and <dir>/.claude.json otherwise.
+state_file() {
+  if [ "$1" = "$DEFAULT" ]; then printf '%s' "$HOME/.claude.json"; else printf '%s' "$ROOT/$1/.claude.json"; fi
+}
+
+account_exists() {
+  valid_name "$1" || return 1
+  [ "$1" = "$DEFAULT" ] || [ -d "$ROOT/$1" ]
+}
+
+list_accounts() {
+  local d n
+  printf '%s\n' "$DEFAULT"
+  for d in "$ROOT"/*/; do
+    [ -d "$d" ] || continue
+    d=${d%/}
+    n=${d##*/}
+    valid_name "$n" && [ "$n" != "$DEFAULT" ] && printf '%s\n' "$n"
+  done
+}
+
+accounts_inline() { list_accounts | tr '\n' ' ' | sed 's/ $//'; }
+
+account_for_config_dir() {
+  local d=${1%/} n
+  if [ -z "$d" ] || [ "$d" = "$DEFAULT_DIR" ]; then printf '%s' "$DEFAULT"; return; fi
+  case $d in
+    "$ROOT"/*)
+      n=${d#"$ROOT"/}
+      case $n in */*) ;; *) printf '%s' "$n" ;; esac
+      ;;
+  esac
+}
+
+email_in() {
+  [ -f "$1" ] || return 0
+  sed -n 's/.*"emailAddress"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | head -n 1
+}
+
+# Folder Rules: one per line, "<folder> <account>". The account is the last word,
+# so folders may contain spaces.
+parse_rule() {
+  local acct
+  trim "$1"
+  case $REPLY in '' | '#'*) return 1 ;; esac
+  acct=${REPLY##*[[:space:]]}
+  if [ "$acct" = "$REPLY" ]; then
+    warn "ignoring Folder Rule without an account: $REPLY"
+    return 1
+  fi
+  RULE_ACCT=$acct
+  trim "${REPLY%"$acct"}"
+  expand_path "$REPLY"
+  RULE_DIR=$REPLY
+}
+
+RULES_LOADED=0
+load_rules() {
+  [ "$RULES_LOADED" = 1 ] && return
+  RULES_LOADED=1
+  RULE_DIRS=()
+  RULE_ACCTS=()
+  RULE_PHYS=()
+  [ -f "$RULES" ] || return 0
+  local line n
+  while IFS= read -r line || [ -n "$line" ]; do
+    parse_rule "$line" || continue
+    n=${#RULE_DIRS[@]}
+    RULE_DIRS[$n]=$RULE_DIR
+    RULE_ACCTS[$n]=$RULE_ACCT
+    RULE_PHYS[$n]=$(phys_dir "$RULE_DIR")
+  done < "$RULES"
+}
+
+# Sets MATCH_ACCT and MATCH_DIR from the deepest Folder Rule covering any of the given paths.
+match_rules() {
+  local best=-1 i=0 p d
+  MATCH_ACCT=
+  MATCH_DIR=
+  load_rules
+  while [ "$i" -lt "${#RULE_DIRS[@]}" ]; do
+    for d in "${RULE_DIRS[$i]}" "${RULE_PHYS[$i]}"; do
+      [ -n "$d" ] || continue
+      for p in "$@"; do
+        [ -n "$p" ] || continue
+        case $p in
+          "$d" | "$d"/*) ;;
+          *) [ "$d" = / ] || continue ;;
+        esac
+        if [ "${#d}" -gt "$best" ]; then
+          best=${#d}
+          MATCH_ACCT=${RULE_ACCTS[$i]}
+          MATCH_DIR=${RULE_DIRS[$i]}
+        fi
+      done
+    done
+    i=$((i + 1))
+  done
+}
+
+find_real_claude() {
+  if [ -n "$CLAUDE_ACCOUNT_REAL_CLAUDE" ]; then
+    [ -x "$CLAUDE_ACCOUNT_REAL_CLAUDE" ] || return 1
+    printf '%s' "$CLAUDE_ACCOUNT_REAL_CLAUDE"
+    return 0
+  fi
+  local self dir c
+  self=$(resolve_file "${BASH_SOURCE[0]}")
+  local IFS=:
+  for dir in $PATH; do
+    [ -n "$dir" ] && [ "$dir" != "$ROOT/bin" ] || continue
+    c="$dir/claude"
+    [ -f "$c" ] && [ -x "$c" ] || continue
+    [ "$(resolve_file "$c")" = "$self" ] && continue
+    printf '%s' "$c"
+    return 0
+  done
+  return 1
+}
+
+# Precedence: Override, then Inherited Account, then Folder Rule, then Default Account.
+run_claude() {
+  local acct real
+  if [ -n "$CLAUDE_ACCOUNT" ]; then
+    account_exists "$CLAUDE_ACCOUNT" ||
+      die "unknown account '$CLAUDE_ACCOUNT' in CLAUDE_ACCOUNT (accounts: $(accounts_inline))"
+    acct=$CLAUDE_ACCOUNT
+  elif [ -n "$CLAUDE_ACCOUNT_ACTIVE" ] && account_exists "$CLAUDE_ACCOUNT_ACTIVE"; then
+    acct=$CLAUDE_ACCOUNT_ACTIVE
+  else
+    match_rules "$PWD" "$(pwd -P)"
+    acct=${MATCH_ACCT:-$DEFAULT}
+    account_exists "$acct" ||
+      die "the Folder Rule for $(tildify "$MATCH_DIR") names unknown account '$acct' (accounts: $(accounts_inline))"
+  fi
+  real=$(find_real_claude) ||
+    die "cannot find the real claude on PATH; set CLAUDE_ACCOUNT_REAL_CLAUDE to its path"
+  export CLAUDE_ACCOUNT_ACTIVE=$acct
+  # The default directory must run with CLAUDE_CONFIG_DIR unset: Claude Code names the
+  # Keychain item after the variable, and only the unset form finds the existing login.
+  if [ "$acct" = "$DEFAULT" ]; then
+    unset CLAUDE_CONFIG_DIR
+  else
+    export CLAUDE_CONFIG_DIR="$ROOT/$acct"
+  fi
+  exec "$real" "$@"
+}
+
+setup_items() {
+  local i f
+  for i in $SETUP_ITEMS; do
+    { [ -e "$DEFAULT_DIR/$i" ] || [ -L "$DEFAULT_DIR/$i" ]; } && printf '%s\n' "$i"
+  done
+  for f in "$DEFAULT_DIR"/*.md; do
+    [ -e "$f" ] || continue
+    i=${f##*/}
+    [ "$i" = CLAUDE.md ] || printf '%s\n' "$i"
+  done
+}
+
+# Links each Setup item from the default directory into $1. Mode "fix" creates
+# missing links; "check" only reports. Counts trouble in PROBLEMS.
+link_setup() {
+  local dir=$1 mode=$2 i target
+  while IFS= read -r i; do
+    [ -n "$i" ] || continue
+    target="$DEFAULT_DIR/$i"
+    if [ -L "$dir/$i" ]; then
+      [ "$(readlink "$dir/$i")" = "$target" ] && continue
+      printf '  %s links to %s, not the shared Setup\n' "$i" "$(readlink "$dir/$i")"
+      PROBLEMS=$((PROBLEMS + 1))
+    elif [ -e "$dir/$i" ]; then
+      printf '  %s is a separate copy, not the shared Setup\n' "$i"
+      PROBLEMS=$((PROBLEMS + 1))
+    elif [ "$mode" = fix ]; then
+      ln -s "$target" "$dir/$i" && printf '  linked %s\n' "$i"
+    else
+      printf '  %s is not linked (run: claude-account doctor --fix)\n' "$i"
+      PROBLEMS=$((PROBLEMS + 1))
+    fi
+  done <<EOF
+$(setup_items)
+EOF
+}
+
+# python3 is probed because on a bare macOS it is a stub that exists but cannot run.
+json_tool() {
+  local t
+  for t in ${CLAUDE_ACCOUNT_JSON_TOOL:-osascript python3 jq}; do
+    command -v "$t" >/dev/null 2>&1 || continue
+    [ "$t" = python3 ] && ! python3 -c pass >/dev/null 2>&1 && continue
+    printf '%s' "$t"
+    return 0
+  done
+  return 1
+}
+
+# Copies a state file, dropping the login identity and anything cached per subscription.
+seed_state() {
+  local src=$1 dst=$2
+  case $(json_tool) in
+    osascript)
+      osascript -l JavaScript - "$src" "$dst" "$PER_SUBSCRIPTION" >/dev/null <<'JS'
+function run(argv) {
+  ObjC.import('Foundation');
+  var text = $.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null);
+  var data = text.isNil() ? {} : JSON.parse(text.js);
+  var perSubscription = new RegExp(argv[2], 'i');
+  Object.keys(data).forEach(function (key) {
+    if (perSubscription.test(key)) delete data[key];
+  });
+  var out = $.NSString.alloc.initWithUTF8String(JSON.stringify(data, null, 2));
+  if (!out.writeToFileAtomicallyEncodingError(argv[1], true, $.NSUTF8StringEncoding, null)) {
+    throw new Error('cannot write ' + argv[1]);
+  }
+}
+JS
+      ;;
+    python3)
+      python3 - "$src" "$dst" "$PER_SUBSCRIPTION" <<'PY'
+import json, re, sys
+src, dst, pattern = sys.argv[1:4]
+try:
+    with open(src) as f:
+        data = json.load(f)
+except FileNotFoundError:
+    data = {}
+per_subscription = re.compile(pattern, re.I)
+data = {k: v for k, v in data.items() if not per_subscription.search(k)}
+with open(dst, "w") as f:
+    json.dump(data, f, indent=2)
+PY
+      ;;
+    jq)
+      if [ -f "$src" ]; then
+        jq --arg p "$PER_SUBSCRIPTION" 'with_entries(select(.key | test($p; "i") | not))' "$src" > "$dst"
+      else
+        printf '{}\n' > "$dst"
+      fi
+      ;;
+    *) return 1 ;;
+  esac || return 1
+  [ -f "$dst" ] && chmod 600 "$dst"
+}
+
+# Prints the keys of one top-level object in a JSON file, one per line.
+json_keys() {
+  [ -f "$1" ] || return 0
+  case $(json_tool) in
+    osascript)
+      osascript -l JavaScript - "$1" "$2" 2>/dev/null <<'JS'
+function run(argv) {
+  ObjC.import('Foundation');
+  var text = $.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null);
+  if (text.isNil()) return '';
+  var value = JSON.parse(text.js)[argv[1]];
+  return value && typeof value === 'object' ? Object.keys(value).sort().join('\n') : '';
+}
+JS
+      ;;
+    python3)
+      python3 - "$1" "$2" 2>/dev/null <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    value = json.load(f).get(sys.argv[2])
+if isinstance(value, dict):
+    print("\n".join(sorted(value)))
+PY
+      ;;
+    jq) jq -r --arg k "$2" '.[$k] | if type == "object" then keys[] else empty end' "$1" 2>/dev/null ;;
+  esac
+}
+
+usage() {
+  cat <<'EOF'
+claude-account: one Claude Code install, several logged-in Accounts, chosen by folder.
+
+Run `claude` as usual. The Account is picked in this order:
+  1. Override         CLAUDE_ACCOUNT=<name> claude
+  2. Inherited        a claude started from inside a session keeps that session's Account
+  3. Folder Rule      the deepest rule covering the current folder
+  4. Default Account  everything else
+
+Commands:
+  install [--default NAME]    link `claude` and `claude-account` into ~/.claude-accounts/bin
+  add NAME [--no-login]       create an Account sharing the Setup, then log in
+  rule FOLDER NAME            run FOLDER and everything beneath it under NAME
+  unrule FOLDER               remove the Folder Rule for FOLDER
+  list                        show Accounts, their logins and the Folder Rules
+  which [FOLDER]              show which Account a folder gets, and why
+  migrate [--apply]           move session history to the Account each folder now uses
+  doctor [--fix]              check PATH, shared Setup links, logins and MCP drift
+  status                      print "Account - email" for the status line
+  uninstall                   remove the wrapper; Accounts and their history stay on disk
+EOF
+}
+
+cmd_install() {
+  local self name=$DEFAULT
+  if [ "$1" = --default ]; then
+    [ -n "$2" ] || die "usage: claude-account install [--default NAME]"
+    name=$2
+  elif [ -n "$1" ]; then
+    die "usage: claude-account install [--default NAME]"
+  fi
+  valid_name "$name" || die "'$name' is not a valid account name"
+  self=$(resolve_file "${BASH_SOURCE[0]}")
+  mkdir -p "$ROOT/bin" "$DEFAULT_DIR" || die "cannot create $ROOT"
+  chmod 700 "$ROOT"
+  ln -sfn "$self" "$ROOT/bin/claude"
+  ln -sfn "$self" "$ROOT/bin/claude-account"
+  [ -f "$ROOT/default" ] || printf '%s\n' "$name" > "$ROOT/default"
+  [ -f "$RULES" ] || printf '# <folder>  <account>    The deepest matching folder wins.\n' > "$RULES"
+  read -r DEFAULT < "$ROOT/default"
+  printf 'Installed into %s/bin (Default Account: %s, using %s).\n' "$(tildify "$ROOT")" "$DEFAULT" "$(tildify "$DEFAULT_DIR")"
+  if [ "$(command -v claude)" != "$ROOT/bin/claude" ]; then
+    printf '\nPut it ahead of the real claude on PATH:\n  export PATH="$HOME/.claude-accounts/bin:$PATH"\n'
+  fi
+}
+
+cmd_add() {
+  local name=$1 login=1 dir
+  [ -n "$name" ] || die "usage: claude-account add NAME [--no-login]"
+  [ "$2" = --no-login ] && login=0
+  valid_name "$name" || die "account names use a-z, 0-9, - and _, and cannot be bin, rules or default"
+  [ "$name" != "$DEFAULT" ] && [ ! -e "$ROOT/$name" ] || die "account '$name' already exists"
+  [ -d "$ROOT/bin" ] || die "run claude-account install first"
+  dir="$ROOT/$name"
+  mkdir -m 700 "$dir" || die "cannot create $dir"
+  printf 'Created account %s in %s\n' "$name" "$(tildify "$dir")"
+  PROBLEMS=0
+  link_setup "$dir" fix
+  if seed_state "$(state_file "$DEFAULT")" "$dir/.claude.json"; then
+    printf '  seeded .claude.json from the %s account, without its login\n' "$DEFAULT"
+  else
+    warn "could not seed $dir/.claude.json (needs osascript, python3 or jq); Claude Code will start it fresh"
+  fi
+  if [ "$login" = 1 ] && [ -t 0 ] && [ -t 1 ]; then
+    printf '\nLogging in to %s...\n' "$name"
+    CLAUDE_ACCOUNT=$name exec "$ROOT/bin/claude" auth login
+  fi
+  printf '\nLog in with:  CLAUDE_ACCOUNT=%s claude auth login\n' "$name"
+}
+
+canonical_folder() {
+  local d
+  expand_path "$1"
+  d=$(phys_dir "$REPLY")
+  [ -n "$d" ] && REPLY=$d
+}
+
+# Writes the rules file minus any rule for folder $1. Sets REMOVED.
+filter_rules() {
+  local line
+  REMOVED=0
+  [ -f "$RULES" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    if parse_rule "$line" 2>/dev/null &&
+      { [ "$RULE_DIR" = "$1" ] || [ "$(phys_dir "$RULE_DIR")" = "$1" ]; }; then
+      REMOVED=$((REMOVED + 1))
+    else
+      printf '%s\n' "$line"
+    fi
+  done < "$RULES"
+}
+
+cmd_rule() {
+  local folder acct=$2
+  [ $# -eq 2 ] || die "usage: claude-account rule FOLDER ACCOUNT"
+  [ -d "$ROOT" ] || die "run claude-account install first"
+  account_exists "$acct" || die "unknown account '$acct' (accounts: $(accounts_inline))"
+  canonical_folder "$1"
+  folder=$REPLY
+  [ -d "$folder" ] || warn "$(tildify "$folder") does not exist yet; saving the rule as written"
+  filter_rules "$folder" > "$RULES.tmp" &&
+    printf '%s\t%s\n' "$folder" "$acct" >> "$RULES.tmp" &&
+    mv "$RULES.tmp" "$RULES" || die "cannot write $RULES"
+  printf '%s -> %s\n' "$(tildify "$folder")" "$acct"
+}
+
+cmd_unrule() {
+  local folder
+  [ $# -eq 1 ] || die "usage: claude-account unrule FOLDER"
+  canonical_folder "$1"
+  folder=$REPLY
+  filter_rules "$folder" > "$RULES.tmp" || die "cannot write $RULES"
+  if [ "$REMOVED" = 0 ]; then
+    rm -f "$RULES.tmp"
+    die "no Folder Rule for $(tildify "$folder")"
+  fi
+  mv "$RULES.tmp" "$RULES"
+  printf 'Removed the Folder Rule for %s\n' "$(tildify "$folder")"
+}
+
+cmd_list() {
+  local acct email i
+  printf 'Accounts\n'
+  for acct in $(list_accounts); do
+    email=$(email_in "$(state_file "$acct")")
+    [ "$acct" = "$DEFAULT" ] && i="$acct (default)" || i=$acct
+    printf '  %-20s %-32s %s\n' "$i" "${email:-not logged in}" "$(tildify "$(account_dir "$acct")")"
+  done
+  printf '\nFolder Rules\n'
+  load_rules
+  if [ "${#RULE_DIRS[@]}" = 0 ]; then
+    printf '  none: every folder uses %s\n' "$DEFAULT"
+    return
+  fi
+  i=0
+  while [ "$i" -lt "${#RULE_DIRS[@]}" ]; do
+    printf '  %s -> %s\n' "$(tildify "${RULE_DIRS[$i]}")" "${RULE_ACCTS[$i]}"
+    i=$((i + 1))
+  done
+}
+
+cmd_which() {
+  local target phys rule_acct reason
+  if [ -n "$1" ]; then
+    expand_path "$1"
+    target=$REPLY
+    phys=$(phys_dir "$target")
+    [ -d "$target" ] || warn "$(tildify "$target") does not exist; matching the path as written"
+  else
+    target=$PWD
+    phys=$(pwd -P)
+  fi
+  match_rules "$target" "$phys"
+  rule_acct=${MATCH_ACCT:-$DEFAULT}
+  if [ -n "$MATCH_DIR" ]; then
+    reason="Folder Rule for $(tildify "$MATCH_DIR")"
+  else
+    reason="no Folder Rule covers it, so the Default Account"
+  fi
+  if [ -n "$CLAUDE_ACCOUNT" ]; then
+    printf '%s (Override: CLAUDE_ACCOUNT is set)\n  without it: %s (%s)\n' "$CLAUDE_ACCOUNT" "$rule_acct" "$reason"
+  elif [ -n "$CLAUDE_ACCOUNT_ACTIVE" ] && account_exists "$CLAUDE_ACCOUNT_ACTIVE"; then
+    printf '%s (Inherited Account from the session that started this shell)\n  in a new terminal: %s (%s)\n' \
+      "$CLAUDE_ACCOUNT_ACTIVE" "$rule_acct" "$reason"
+  else
+    printf '%s (%s)\n' "$rule_acct" "$reason"
+  fi
+}
+
+# Finds the folder a projects/<name> directory belongs to. Sets REPLY.
+project_path() {
+  local dir=$1 name=${1##*/} p= f
+  if [ -f "$dir/sessions-index.json" ]; then
+    p=$(sed -n 's/.*"projectPath"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$dir/sessions-index.json" | head -n 1)
+  fi
+  if [ -z "$p" ]; then
+    for f in "$dir"/*.jsonl; do
+      [ -f "$f" ] || continue
+      p=$(head -n 50 "$f" | sed -n 's/.*"cwd":"\([^"]*\)".*/\1/p' | head -n 1)
+      [ -n "$p" ] && break
+    done
+  fi
+  # Last resort: a folder Claude Code has seen, whose encoded name matches.
+  if [ -z "$p" ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] && [ "${f//[^a-zA-Z0-9]/-}" = "$name" ] && { p=$f; break; }
+    done <<EOF
+$KNOWN_PATHS
+EOF
+  fi
+  [ -n "$p" ] || return 1
+  REPLY=$p
+}
+
+repoint_index() {
+  local index=$1 old="$2/" new="$3/" content
+  [ -f "$index" ] || return 0
+  content=$(cat "$index") || return 1
+  printf '%s\n' "${content//"$old"/$new}" > "$index.tmp" && mv "$index.tmp" "$index"
+}
+
+cmd_migrate() {
+  local apply=0 acct target p folder dest moves=0 skipped=0 unknown=0
+  case $1 in
+    '') ;;
+    --apply) apply=1 ;;
+    *) die "usage: claude-account migrate [--apply]" ;;
+  esac
+  KNOWN_PATHS=
+  for acct in $(list_accounts); do
+    KNOWN_PATHS="$KNOWN_PATHS
+$(json_keys "$(state_file "$acct")" projects)"
+  done
+  for acct in $(list_accounts); do
+    for p in "$(account_dir "$acct")"/projects/*/; do
+      [ -d "$p" ] || continue
+      p=${p%/}
+      if ! project_path "$p"; then
+        printf '  ? %s: cannot tell which folder this is; left under %s\n' "${p##*/}" "$acct"
+        unknown=$((unknown + 1))
+        continue
+      fi
+      folder=$REPLY
+      match_rules "$folder" "$(phys_dir "$folder")"
+      target=${MATCH_ACCT:-$DEFAULT}
+      [ "$target" = "$acct" ] && continue
+      if ! account_exists "$target"; then
+        printf '  ! %s: rule names unknown account %s; left under %s\n' "$(tildify "$folder")" "$target" "$acct"
+        skipped=$((skipped + 1))
+        continue
+      fi
+      dest="$(account_dir "$target")/projects/${p##*/}"
+      if [ -e "$dest" ]; then
+        printf '  ! %s: %s already has history for it; left under %s\n' "$(tildify "$folder")" "$target" "$acct"
+        skipped=$((skipped + 1))
+        continue
+      fi
+      printf '  %s: %s -> %s\n' "$(tildify "$folder")" "$acct" "$target"
+      moves=$((moves + 1))
+      if [ "$apply" = 1 ]; then
+        mkdir -p "${dest%/*}" && mv "$p" "$dest" || die "could not move $p"
+        repoint_index "$dest/sessions-index.json" "$p" "$dest" || warn "could not update $dest/sessions-index.json"
+      fi
+    done
+  done
+  printf '\n%s project(s) %s, %s skipped, %s unrecognised.\n' "$moves" \
+    "$([ "$apply" = 1 ] && echo moved || echo to move)" "$skipped" "$unknown"
+  if [ "$apply" = 0 ] && [ "$moves" -gt 0 ]; then
+    printf 'This was a dry run. Close Claude sessions in those folders, then run:\n  claude-account migrate --apply\n'
+  fi
+}
+
+cmd_doctor() {
+  local fix=check acct dir email where real base other line i
+  [ "$1" = --fix ] && fix=fix
+  PROBLEMS=0
+  where=$(command -v claude)
+  if [ "$where" = "$ROOT/bin/claude" ]; then
+    printf 'ok  claude on PATH is the wrapper\n'
+  else
+    printf 'BAD claude on PATH is %s; put %s ahead of it\n' "${where:-missing}" "$(tildify "$ROOT/bin")"
+    PROBLEMS=$((PROBLEMS + 1))
+  fi
+  if real=$(find_real_claude); then
+    printf 'ok  real Claude Code: %s\n' "$(tildify "$real")"
+  else
+    printf 'BAD cannot find the real claude on PATH\n'
+    PROBLEMS=$((PROBLEMS + 1))
+  fi
+  for acct in $(list_accounts); do
+    dir=$(account_dir "$acct")
+    if [ ! -d "$dir" ]; then
+      printf 'BAD %s: %s is missing\n' "$acct" "$(tildify "$dir")"
+      PROBLEMS=$((PROBLEMS + 1))
+      continue
+    fi
+    if [ "$acct" != "$DEFAULT" ]; then
+      link_setup "$dir" "$fix"
+      if [ -f "$dir/.config.json" ]; then
+        printf 'BAD %s: %s/.config.json takes priority over .claude.json\n' "$acct" "$(tildify "$dir")"
+        PROBLEMS=$((PROBLEMS + 1))
+      fi
+    fi
+    email=$(email_in "$(state_file "$acct")")
+    if [ -n "$email" ]; then
+      printf 'ok  %s: %s\n' "$acct" "$email"
+    else
+      printf 'BAD %s: not logged in (run: CLAUDE_ACCOUNT=%s claude auth login)\n' "$acct" "$acct"
+      PROBLEMS=$((PROBLEMS + 1))
+    fi
+  done
+  load_rules
+  i=0
+  while [ "$i" -lt "${#RULE_DIRS[@]}" ]; do
+    if ! account_exists "${RULE_ACCTS[$i]}"; then
+      printf 'BAD Folder Rule %s names unknown account %s\n' "$(tildify "${RULE_DIRS[$i]}")" "${RULE_ACCTS[$i]}"
+      PROBLEMS=$((PROBLEMS + 1))
+    elif [ ! -d "${RULE_DIRS[$i]}" ]; then
+      printf 'note Folder Rule %s points at a folder that does not exist\n' "$(tildify "${RULE_DIRS[$i]}")"
+    fi
+    i=$((i + 1))
+  done
+  # User-level MCP servers live in each state file, so they can differ between Accounts.
+  base=$(json_keys "$(state_file "$DEFAULT")" mcpServers)
+  for acct in $(list_accounts); do
+    [ "$acct" = "$DEFAULT" ] && continue
+    other=$(json_keys "$(state_file "$acct")" mcpServers)
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      printf '%s\n' "$other" | grep -qxF -- "$line" ||
+        printf 'note MCP server %s exists for %s but not %s\n' "$line" "$DEFAULT" "$acct"
+    done <<EOF
+$base
+EOF
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      printf '%s\n' "$base" | grep -qxF -- "$line" ||
+        printf 'note MCP server %s exists for %s but not %s\n' "$line" "$acct" "$DEFAULT"
+    done <<EOF
+$other
+EOF
+  done
+  if [ "$PROBLEMS" = 0 ]; then
+    printf '\nNo problems found.\n'
+  else
+    printf '\n%s problem(s) found.\n' "$PROBLEMS"
+    return 1
+  fi
+}
+
+cmd_uninstall() {
+  local acct
+  rm -f "$ROOT/bin/claude" "$ROOT/bin/claude-account"
+  rmdir "$ROOT/bin" 2>/dev/null
+  printf 'Removed the wrapper. `claude` now runs Claude Code directly, under %s.\n' "$(tildify "$DEFAULT_DIR")"
+  for acct in $(list_accounts); do
+    [ "$acct" = "$DEFAULT" ] && continue
+    printf '\nAccount %s is still in %s with its login and history.\n' "$acct" "$(tildify "$ROOT/$acct")"
+    printf '  log out:  CLAUDE_CONFIG_DIR="%s" claude auth logout\n' "$ROOT/$acct"
+  done
+  printf '\nDelete %s once you no longer need what is in it.\n' "$(tildify "$ROOT")"
+}
+
+# Reads the state file the running session uses, so the email shown is the real login.
+cmd_status() {
+  local acct email
+  acct=$(account_for_config_dir "$CLAUDE_CONFIG_DIR")
+  [ -n "$acct" ] || acct=${CLAUDE_CONFIG_DIR##*/}
+  email=$(email_in "${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json")
+  printf '%s - %s' "$(capitalize "$acct")" "${email:-not logged in}"
+}
+
+case ${0##*/} in
+  claude) run_claude "$@" ;;
+  *)
+    cmd=$1
+    [ $# -gt 0 ] && shift
+    case $cmd in
+      install | add | rule | unrule | list | which | migrate | doctor | status | uninstall) "cmd_$cmd" "$@" ;;
+      '' | help | -h | --help) usage ;;
+      *) die "unknown command '$cmd' (see: claude-account help)" ;;
+    esac
+    ;;
+esac
