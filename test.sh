@@ -137,6 +137,8 @@ check "status default" "Personal - work@corp.example" "$(claude-account status)"
 check "status before login" "Work - not logged in" "$(CLAUDE_CONFIG_DIR="$W" claude-account status)"
 printf '{\n  "oauthAccount": {\n    "emailAddress": "me@work.example"\n  }\n}\n' > "$W/.claude.json"
 check "status after login" "Work - me@work.example" "$(CLAUDE_CONFIG_DIR="$W" claude-account status)"
+contains "context names the Account" "Account \"Work\" (me@work.example)" "$(CLAUDE_CONFIG_DIR="$W" claude-account context)"
+contains "context default" "Account \"Personal\" (work@corp.example), config directory ~/.claude." "$(claude-account context)"
 
 # migrate
 PR="$HOME/.claude/projects"

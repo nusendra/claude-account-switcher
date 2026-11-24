@@ -73,6 +73,26 @@ If the login that is in `~/.claude` today should not be your default account, ad
 
 The email is read from the state file of the running session, so it shows who is really logged in.
 
+## Tell Claude which account it is on
+
+Apps that drive Claude Code without its terminal screen, such as desktop and web front ends, do not draw the status line. `claude-account context` prints one sentence naming the account, and a `SessionStart` hook hands it to Claude at the start of every session, so it can tell you which account and email the session uses:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "\"$HOME\"/.claude-accounts/bin/claude-account context" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+It reads the same state file as `status`, so it names the login the session really uses.
+
 ## Commands
 
 | Command | What it does |
@@ -86,6 +106,7 @@ The email is read from the state file of the running session, so it shows who is
 | `claude-account migrate [--apply]` | Move session history to the account each folder now uses |
 | `claude-account doctor [--fix]` | Check `PATH`, shared setup links, logins and MCP differences |
 | `claude-account status` | Print `Account - email` for the status line |
+| `claude-account context` | Print the account as a sentence for a `SessionStart` hook |
 | `claude-account uninstall` | Remove the wrapper and leave accounts and history on disk |
 
 Rules live in `~/.claude-accounts/rules`, one per line, and you can edit the file by hand:

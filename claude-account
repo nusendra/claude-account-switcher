@@ -369,6 +369,7 @@ Commands:
   migrate [--apply]           move session history to the Account each folder now uses
   doctor [--fix]              check PATH, shared Setup links, logins and MCP drift
   status                      print "Account - email" for the status line
+  context                     print the Account for a SessionStart hook
   uninstall                   remove the wrapper; Accounts and their history stay on disk
 EOF
 }
@@ -694,12 +695,25 @@ cmd_uninstall() {
 }
 
 # Reads the state file the running session uses, so the email shown is the real login.
+# Sets SESSION_ACCT and SESSION_EMAIL.
+session_account() {
+  SESSION_ACCT=$(account_for_config_dir "$CLAUDE_CONFIG_DIR")
+  [ -n "$SESSION_ACCT" ] || SESSION_ACCT=${CLAUDE_CONFIG_DIR##*/}
+  SESSION_EMAIL=$(email_in "${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json")
+}
+
 cmd_status() {
-  local acct email
-  acct=$(account_for_config_dir "$CLAUDE_CONFIG_DIR")
-  [ -n "$acct" ] || acct=${CLAUDE_CONFIG_DIR##*/}
-  email=$(email_in "${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json")
-  printf '%s - %s' "$(capitalize "$acct")" "${email:-not logged in}"
+  session_account
+  printf '%s - %s' "$(capitalize "$SESSION_ACCT")" "${SESSION_EMAIL:-not logged in}"
+}
+
+# For a SessionStart hook: its output becomes context, so Claude can say which Account
+# it runs under in apps that do not draw the status line.
+cmd_context() {
+  session_account
+  printf 'This Claude Code session runs under the claude-account Account "%s" (%s), config directory %s. ' \
+    "$(capitalize "$SESSION_ACCT")" "${SESSION_EMAIL:-not logged in}" "$(tildify "${CLAUDE_CONFIG_DIR:-$DEFAULT_DIR}")"
+  printf 'When asked which Claude account, email or subscription this session uses, answer from this.\n'
 }
 
 case ${0##*/} in
@@ -708,7 +722,7 @@ case ${0##*/} in
     cmd=$1
     [ $# -gt 0 ] && shift
     case $cmd in
-      install | add | rule | unrule | list | which | migrate | doctor | status | uninstall) "cmd_$cmd" "$@" ;;
+      install | add | rule | unrule | list | which | migrate | doctor | status | context | uninstall) "cmd_$cmd" "$@" ;;
       '' | help | -h | --help) usage ;;
       *) die "unknown command '$cmd' (see: claude-account help)" ;;
     esac
